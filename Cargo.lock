@@ -1798,6 +1798,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-web-host"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=e2dc681a3#e2dc681a3ad8a47038da2f11ddd2c5e1c0454991"
+dependencies = [
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "craft-winprint-gdi"
 version = "0.1.0"
 source = "git+https://github.com/storytold/winprint.rs?rev=64e7afd4d1483512385012c340ecaaaf0f3beb7f#64e7afd4d1483512385012c340ecaaaf0f3beb7f"
@@ -6013,6 +6022,7 @@ version = "0.23.1"
 dependencies = [
  "craft-image-codecs",
  "craft-psd 0.1.0 (git+https://github.com/storytold/craft-libs?rev=eafb50aff3c6b1acc14dff53060157877e3e4fce)",
+ "craft-web-host",
  "eframe",
  "egui",
  "js-sys",

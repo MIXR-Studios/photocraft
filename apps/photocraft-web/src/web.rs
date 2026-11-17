@@ -84,6 +84,8 @@ pub fn start() {
             }
         };
         let pen_target = canvas.clone();
+        // MIXR: framed with `?host=parent` (our Creative Suite), Open and Save go through the parent window.
+        let host: Option<Rc<craft_web_host::web::Host>> = craft_web_host::web::Host::connect("photocraft", &pen_target).map(Rc::new);
         let runner = eframe::WebRunner::new();
         // After the runner's own panic handler, so the message is kept and the runner's handler
         // still runs (a panic aborts the module).
@@ -105,7 +107,10 @@ pub fn start() {
                     let actions_revision = session.actions.rev;
                     preset_warnings.extend(warnings);
                     let drag = listen_drag(&pen_target);
-                    let mut services = services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag));
+                    if let Some(host) = &host {
+                        listen_host(host, inbox.clone(), cc.egui_ctx.clone());
+                    }
+                    let mut services = services(inbox.clone(), place_inbox.clone(), drag_pos_service(pen_target.clone(), drag), host.clone());
                     let mut initial = Some(load_initial_preferences(&presets, database.is_some() && !session.actions.list.is_empty()));
                     services.load_prefs = Some(Box::new(move || initial.take().unwrap_or_else(stored_preferences)));
                     let mut app = PhotocraftApp::new(session, services);
@@ -122,7 +127,11 @@ pub fn start() {
                     }
                     let unsaved = Arc::new(AtomicBool::new(false));
                     guard_unload(unsaved.clone());
+                    if let Some(host) = &host {
+                        let _ = host.post_ready(env!("CARGO_PKG_VERSION"), true);
+                    }
                     Ok(Box::new(WebShell {
+                        host,
                         app,
                         inbox,
                         place_inbox,
@@ -358,6 +367,8 @@ async fn fetch_bytes(url: &str, integrity: Option<&str>) -> Result<Vec<u8>, Stri
 /// Wraps the app to read dropped files asynchronously (browsers can't read them synchronously,
 /// so the app's own drop path can't handle them) and feed them through the inboxes.
 struct WebShell {
+    /// The hosting page (our Creative Suite), when framed with `?host=parent`.
+    host: Option<Rc<craft_web_host::web::Host>>,
     app: PhotocraftApp,
     /// Dropped files to open as documents.
     inbox: Inbox,
@@ -403,6 +414,9 @@ impl WebShell {
             });
         }
         self.unsaved.store(self.app.has_unsaved_work() || self.presets.unsaved(), Ordering::Relaxed);
+        if let Some(host) = &self.host {
+            host.post_dirty(self.app.has_unsaved_work());
+        }
     }
 
     /// Fetches the served families asked for (picked in a font menu, or needed by a layout) and
@@ -549,7 +563,38 @@ impl eframe::App for WebShell {
     }
 }
 
-fn services(inbox: Inbox, place_inbox: PlaceInbox, cursor_pos: photocraft_ui_egui::CursorPosFn) -> Services {
+/// The largest document the hosting page may send (browsers cap WebAssembly memory near 4 GB).
+const HOST_OPEN_MAX: f64 = (1u64 << 30) as f64;
+
+/// MIXR: documents the hosting page sends (`photocraft:open`) open like a dropped file.
+fn listen_host(host: &craft_web_host::web::Host, inbox: Inbox, ctx: egui::Context) {
+    use craft_web_host::web::{FileData, Message};
+    host.listen(move |message| {
+        let Message::Open { name, data } = message else { return };
+        if data.size() > HOST_OPEN_MAX {
+            log::warn!("{name} is too large to open in the browser");
+            return;
+        }
+        let (inbox, ctx) = (inbox.clone(), ctx.clone());
+        wasm_bindgen_futures::spawn_local(async move {
+            let bytes = match data {
+                FileData::Bytes(array) => array.to_vec(),
+                FileData::Blob(blob) => match wasm_bindgen_futures::JsFuture::from(blob.array_buffer()).await {
+                    Ok(buffer) => js_sys::Uint8Array::new(&buffer).to_vec(),
+                    Err(e) => {
+                        log::error!("couldn't read {name} from the host: {e:?}");
+                        return;
+                    }
+                },
+            };
+            inbox.lock().unwrap_or_else(PoisonError::into_inner).push((name, bytes));
+            ctx.request_repaint();
+        });
+    });
+}
+
+fn services(inbox: Inbox, place_inbox: PlaceInbox, cursor_pos: photocraft_ui_egui::CursorPosFn, host: Option<Rc<craft_web_host::web::Host>>) -> Services {
+    let hosted = host.is_some();
     Services {
         screen_pick: screen_color_service(),
         import: Some(Box::new(|name: &str, bytes: &[u8], opts: &photocraft_io::ImportOptions| {
@@ -594,9 +639,17 @@ fn services(inbox: Inbox, place_inbox: PlaceInbox, cursor_pos: photocraft_ui_egu
                 reply.send(Some(FileDialogAnswer::SaveTo(name)));
             }
         })),
-        write: Some(Box::new(|path: &str, bytes: &[u8]| download(path, bytes))),
+        write: Some(Box::new(move |path: &str, bytes: &[u8]| match &host {
+            // MIXR: the hosting page stores the file; posting it is the save.
+            Some(host) => {
+                let name = std::path::Path::new(path).file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+                host.post_save(&name, bytes, None, false)
+            }
+            None => download(path, bytes),
+        })),
         // A download may be cancelled and never reports back: it doesn't save the document.
-        write_unconfirmed: true,
+        // A post to the hosting page always arrives.
+        write_unconfirmed: !hosted,
         encode_png: Some(Box::new(|w, h, rgba| {
             let img = Image::from_u8(w, h, ChannelLayout::Rgba, rgba.to_vec()).map_err(|e| e.to_string())?;
             photocraft_codecs::encode(&img, photocraft_codecs::Format::Png, &EncodeOptions::default()).map_err(|e| e.to_string())
